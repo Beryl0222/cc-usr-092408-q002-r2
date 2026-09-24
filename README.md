@@ -18,6 +18,10 @@
 - **规则与复核分离**：自动规则只能产生 `suspected`（涉嫌）发现；复核员 `confirmed`
   后才建立整改案件，已确认且尚未告知的发现才能进入告知材料，整改期限取所依据各版
   规范中最短者。
+- **复核终态与更正**：涉嫌发现只能完成一次初始复核，完全相同的重复请求幂等返回，
+  结论或复核人变化不得原地覆盖（冲突返回 `409`）。确需纠正时由授权角色（监督，
+  HTTP `403` 拒绝越权）追加带理由与前序结论引用的更正记录，并按当前有效结论重新
+  计算案件状态、待告知项与复测资格；历史告知快照永久保持出具时原样。
 - **复测不抹历史、回潮可累计**：复测通过只关闭当前整改周期，周期内问题时段
   （首末观测时间）永久保留；已整改后再次确认问题开启新周期，`relapse_count` 加一，
   承办人员可按责任主体看到历次周期、告知、复测（含失败记录）与期限。
@@ -39,12 +43,14 @@
 python3 service.py --check          # 基础自检
 python3 service.py --port 8000      # 启动服务
 LAB_DATA_FILE=lab.json python3 service.py   # 证据快照落盘，重启恢复
-npm test                            # 运行契约 + 领域 + HTTP 共 18 项测试
+npm test                            # 运行契约 + 领域 + HTTP 共 33 项测试
 ```
 
 ## 接口一览
 
-所有请求/响应均为 UTF-8 JSON；领域错误返回 `400`，实体不存在返回 `404`。
+所有请求/响应均为 UTF-8 JSON；领域错误返回 `400`，实体不存在返回 `404`，
+发现已有终态且请求非幂等重放返回 `409`，更正角色未授权返回 `403`，
+持久化等服务端错误返回 `500`（失败写盘会回滚内存，不留下半个案件周期）。
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -56,12 +62,13 @@ npm test                            # 运行契约 + 领域 + HTTP 共 18 项测
 | `POST /tasks` | 创建采集任务（`build_id`、`device_id`、`track`），响应含固化版本 |
 | `POST /tasks/{id}/events` | 幂等上报事件批次 `{"events": [...]}`，返回 `accepted/duplicates` |
 | `POST /tasks/{id}/complete` | 完成采集并运行规则 |
-| `GET /tasks/{id}` | 单任务报告：设备/系统/构建/无障碍设置/操作轨迹/发现与证据 |
+| `GET /tasks/{id}` | 单任务报告：设备/系统/构建/无障碍设置/操作轨迹/发现与证据/完整复核链 |
 | `GET /builds/{id}/report` | 同一构建跨设备、跨轨迹汇总 |
-| `POST /findings/{id}/review` | 复核：`{"decision": "confirmed|dismissed", "reviewer"}` |
+| `POST /findings/{id}/review` | 初始复核（仅一次）：`{"decision": "confirmed|dismissed", "reviewer"}`；完全相同请求幂等返回（`idempotent=true`） |
+| `POST /findings/{id}/corrections` | 追加更正：`{"decision", "reviewer", "reviewer_role": "supervisor", "reason"}`，含前序结论引用与告知状态 |
 | `POST /subjects/{type}/{id}/notices` | 对已确认发现出具告知材料（期限、依据版本、证据快照） |
-| `POST /subjects/{type}/{id}/retests` | 登记复测 `{"task_id": ...}`，通过则关闭当前周期 |
-| `GET /subjects/{type}/{id}` | 承办人员视图：各整改周期、期限、问题时段、回潮次数 |
+| `POST /subjects/{type}/{id}/retests` | 登记复测 `{"task_id": ...}`，通过则关闭当前周期；更正后自动重算复测结论 |
+| `GET /subjects/{type}/{id}` | 承办人员视图：各整改周期、期限、问题时段、回潮次数、更正审计链 |
 
 ### 事件结构
 

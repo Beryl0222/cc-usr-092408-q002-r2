@@ -5,6 +5,7 @@
 """
 
 import argparse
+import copy
 import json
 import os
 import threading
@@ -12,6 +13,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from domain import (
+    AuthorizationError,
+    ConflictError,
     DomainError,
     Lab,
     NotFoundError,
@@ -52,10 +55,18 @@ class Store:
 
     def call(self, fn, *args, persist=False, **kwargs):
         with self.lock:
-            result = fn(*args, **kwargs)
-            if persist:
-                self.save()
-            return result
+            # 落盘操作先留快照：业务执行成功但写盘失败时整体回滚，
+            # 不允许内存中留下无法恢复的「半个案件周期」。
+            backup = copy.deepcopy(self.lab.to_snapshot()) if persist else None
+            try:
+                result = fn(*args, **kwargs)
+                if persist:
+                    self.save()
+                return result
+            except Exception:
+                if backup is not None:
+                    self.lab = Lab.from_snapshot(backup)
+                raise
 
 
 STORE = Store(DATA_FILE)
@@ -119,8 +130,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json_404()
         except NotFoundError as exc:
             self._send_json(404, {"error": "not_found", "message": str(exc)})
+        except AuthorizationError as exc:
+            self._send_json(403, {"error": "forbidden", "message": str(exc)})
+        except ConflictError as exc:
+            self._send_json(409, {"error": "conflict", "message": str(exc)})
         except DomainError as exc:
             self._send_json(400, {"error": "domain_error", "message": str(exc)})
+        except Exception as exc:
+            self._send_json(500, {"error": "internal_error", "message": str(exc)})
 
     def do_POST(self):
         path = urlsplit(self.path).path.rstrip("/") or "/"
@@ -162,6 +179,11 @@ class Handler(BaseHTTPRequestHandler):
                 finding_id = unquote(path[len("/findings/"):-len("/review")].rstrip("/"))
                 self._send_json(200, STORE.call(lab.review_finding, finding_id, payload, persist=True))
                 return
+            if path.startswith("/findings/") and path.endswith("/corrections"):
+                finding_id = unquote(path[len("/findings/"):-len("/corrections")].rstrip("/"))
+                result = STORE.call(lab.correct_finding, finding_id, payload, persist=True)
+                self._send_json(200 if result.get("idempotent") else 201, result)
+                return
 
             if path.startswith("/subjects/"):
                 parts = path.split("/")
@@ -185,8 +207,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json_404()
         except NotFoundError as exc:
             self._send_json(404, {"error": "not_found", "message": str(exc)})
+        except AuthorizationError as exc:
+            self._send_json(403, {"error": "forbidden", "message": str(exc)})
+        except ConflictError as exc:
+            self._send_json(409, {"error": "conflict", "message": str(exc)})
         except DomainError as exc:
             self._send_json(400, {"error": "domain_error", "message": str(exc)})
+        except Exception as exc:  # 含持久化失败：仓储已回滚，返回 500 不留半成品
+            self._send_json(500, {"error": "internal_error", "message": str(exc)})
 
     def log_message(self, *_args):
         return

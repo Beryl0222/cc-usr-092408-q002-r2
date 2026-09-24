@@ -16,6 +16,7 @@
 from dataclasses import dataclass, field
 from itertools import count
 from time import time
+import copy
 
 # 三条标准操作轨迹
 TRACK_NORMAL = "normal"            # 正常用户
@@ -57,6 +58,15 @@ FINDING_SUSPECTED = "suspected"
 FINDING_CONFIRMED = "confirmed"
 FINDING_DISMISSED = "dismissed"
 
+# 复核环节：初始复核只能一次，之后只能「更正」
+REVIEW_INITIAL = "initial"
+REVIEW_CORRECTION = "correction"
+
+# 初始复核：复核员；更正：授权角色（监督/复核负责人）
+REVIEWER_ROLE_REVIEWER = "reviewer"
+REVIEWER_ROLE_SUPERVISOR = "supervisor"
+CORRECTION_ROLES = (REVIEWER_ROLE_SUPERVISOR,)
+
 CASE_OPEN = "open"
 CASE_RECTIFIED = "rectified"
 
@@ -91,6 +101,14 @@ class NotFoundError(LookupError):
     """引用的实体不存在。"""
 
 
+class ConflictError(DomainError):
+    """发现已有终态且请求并非幂等重放/合法更正（HTTP 409）。"""
+
+
+class AuthorizationError(DomainError):
+    """更正缺少授权角色（HTTP 403）。"""
+
+
 def _require(payload, key, entity):
     if key not in payload or payload[key] in (None, ""):
         raise DomainError(f"{entity}缺少必填字段：{key}")
@@ -121,6 +139,7 @@ class Lab:
     findings: dict = field(default_factory=dict)
     cases: dict = field(default_factory=dict)             # case 键为责任主体
     notices: dict = field(default_factory=dict)
+    corrections: dict = field(default_factory=dict)       # correction_id -> 更正记录（审计链）
 
     def _new_id(self, prefix):
         return f"{prefix}-{next(self._seq):04d}"
@@ -534,6 +553,14 @@ class Lab:
     # ------------------------------------------------------------------ #
 
     def review_finding(self, finding_id, payload):
+        """对涉嫌发现作唯一一次初始复核。
+
+        终态规则：
+
+        * 只有 ``suspected`` 发现接受初始复核，初始结论一经作出不得原地覆盖；
+        * 完全相同的重复请求（结论/复核人/意见一致）幂等返回既有结论；
+        * 结论或复核人不同必须走 :meth:`correct_finding` 追加更正记录。
+        """
         try:
             finding = self.findings[finding_id]
         except KeyError:
@@ -542,13 +569,121 @@ class Lab:
         if decision not in (FINDING_CONFIRMED, FINDING_DISMISSED):
             raise DomainError("复核结论只能是 confirmed 或 dismissed")
         reviewer = _require(payload, "reviewer", "复核结论")
+        comment = payload.get("comment", "")
+
+        if finding["status"] != FINDING_SUSPECTED:
+            initial = self._initial_review(finding)
+            if (decision, reviewer, comment) == (
+                    initial["decision"], initial["reviewer"], initial.get("comment", "")):
+                return {"idempotent": True, "replay_of": initial["review_id"],
+                        "review": initial, "finding": finding}
+            raise ConflictError(
+                "发现已完成初始复核且结论不可覆盖；确需纠正请通过更正接口，"
+                "并提供更正理由与授权角色"
+            )
+
+        record = {
+            "review_id": self._new_id("review"),
+            "kind": REVIEW_INITIAL,
+            "decision": decision,
+            "reviewer": reviewer,
+            "reviewer_role": payload.get("reviewer_role", REVIEWER_ROLE_REVIEWER),
+            "comment": comment,
+            "at": self.clock(),
+            "superseded_by": None,
+        }
+        finding.setdefault("reviews", []).append(record)
         finding["status"] = decision
         finding["reviewed_by"] = reviewer
-        finding["reviewed_at"] = self.clock()
-        finding["review_comment"] = payload.get("comment", "")
+        finding["reviewed_at"] = record["at"]
+        finding["review_comment"] = comment
         if decision == FINDING_CONFIRMED:
             self._attach_to_case(finding)
-        return finding
+        return {"idempotent": False, "replay_of": None,
+                "review": record, "finding": finding}
+
+    def correct_finding(self, finding_id, payload):
+        """追加一条带理由、授权角色与前序结论引用的更正记录。
+
+        不覆盖初始结论、不改写历史告知快照；按当前有效结论重新计算案件周期、
+        待告知项与复测资格。完全相同的更正请求幂等返回。
+        """
+        try:
+            finding = self.findings[finding_id]
+        except KeyError:
+            raise NotFoundError(f"发现不存在：{finding_id}")
+        if finding["status"] == FINDING_SUSPECTED:
+            raise ConflictError("发现尚未完成初始复核，不能更正；请先完成初始复核")
+        new_decision = _require(payload, "decision", "更正结论")
+        if new_decision not in (FINDING_CONFIRMED, FINDING_DISMISSED):
+            raise DomainError("复核结论只能是 confirmed 或 dismissed")
+        reviewer = _require(payload, "reviewer", "更正记录")
+        role = _require(payload, "reviewer_role", "更正记录")
+        if role not in CORRECTION_ROLES:
+            raise AuthorizationError(
+                f"更正须由授权角色（{', '.join(CORRECTION_ROLES)}）作出，当前角色：{role}"
+            )
+        reason = _require(payload, "reason", "更正记录")
+        comment = payload.get("comment", "")
+
+        latest = self._latest_review(finding)
+        if latest["kind"] == REVIEW_CORRECTION and (
+                new_decision, reviewer, role, reason, comment) == (
+                latest["decision"], latest["reviewer"], latest["reviewer_role"],
+                latest["reason"], latest.get("comment", "")):
+            return {"idempotent": True, "replay_of": latest["review_id"],
+                    "review": latest, "finding": finding}
+        if new_decision == finding["status"]:
+            raise ConflictError("更正结论与当前有效结论一致，无需更正")
+
+        was_noticed = bool(finding.get("notice_id"))
+        prior_cycle_seq = finding.get("case_cycle_seq")
+        record = {
+            "review_id": self._new_id("review"),
+            "kind": REVIEW_CORRECTION,
+            "finding_id": finding_id,
+            "decision": new_decision,
+            "reviewer": reviewer,
+            "reviewer_role": role,
+            "reason": reason,
+            "comment": comment,
+            "at": self.clock(),
+            "supersedes": latest["review_id"],
+            "prior_decision": finding["status"],
+            "notice_issued": was_noticed,
+            "notice_id": finding.get("notice_id"),
+            # 更正发生时所在的案件周期：发现被摘除后审计链仍归属原周期
+            "case_id": finding.get("case_id"),
+            "cycle_seq": prior_cycle_seq,
+            "superseded_by": None,
+        }
+        latest["superseded_by"] = record["review_id"]
+        finding["reviews"].append(record)
+        finding["status"] = new_decision
+        self.corrections[record["review_id"]] = record
+
+        if new_decision == FINDING_CONFIRMED:
+            # 驳回后改判确认：重新挂入（可能开启回潮新周期），并重算复测结论
+            self._attach_to_case(finding)
+            key = _subject_key(finding["responsible_subject"])
+            case = self.cases.get(key)
+            if case is not None:
+                cycle = next(c for c in case["cycles"] if c["seq"] == finding["case_cycle_seq"])
+                self._recompute_cycle(case, cycle)
+                case["status"] = cycle["status"]
+        else:
+            # 确认后改判驳回：摘除前记录其曾进入的告知材料
+            self._detach_from_case(finding)
+        return {"idempotent": False, "replay_of": None,
+                "review": record, "finding": finding}
+
+    @staticmethod
+    def _initial_review(finding):
+        return finding.get("reviews", [None])[0]
+
+    @staticmethod
+    def _latest_review(finding):
+        return finding["reviews"][-1]
 
     def _attach_to_case(self, finding):
         subject = finding["responsible_subject"]
@@ -583,7 +718,61 @@ class Lab:
             cycle["finding_ids"].append(finding["finding_id"])
         finding["case_id"] = case["case_id"]
         finding["case_cycle_seq"] = cycle["seq"]
+        finding.setdefault("notice_id", None)
         return case
+
+    def _detach_from_case(self, finding):
+        """确认改判驳回时把发现从案件周期摘除，并重算/修剪周期与案件状态。"""
+        key = _subject_key(finding["responsible_subject"])
+        case = self.cases.get(key)
+        if case is None:
+            finding.pop("case_id", None)
+            finding.pop("case_cycle_seq", None)
+            finding.pop("notice_id", None)
+            return
+        seq = finding.get("case_cycle_seq")
+        cycle = next((c for c in case["cycles"] if c["seq"] == seq), None)
+        if cycle is not None and finding["finding_id"] in cycle["finding_ids"]:
+            cycle["finding_ids"].remove(finding["finding_id"])
+            self._recompute_cycle(case, cycle)
+            # 纯由附件关系产生、从未告知也无复测的末周期随最后一条发现摘除而回滚
+            if (cycle is case["cycles"][-1] and not cycle["finding_ids"]
+                    and not cycle["notice_ids"] and not cycle["retests"]):
+                case["cycles"].pop()
+                case["relapse_count"] = max(0, case["relapse_count"] - 1)
+        finding.pop("case_id", None)
+        finding.pop("case_cycle_seq", None)
+        finding.pop("notice_id", None)
+        if not case["cycles"]:
+            # 案件失去全部依据：删除案件（历史告知材料仍在 notices 中留存）
+            del self.cases[key]
+        else:
+            case["status"] = case["cycles"][-1]["status"]
+
+    def _recompute_cycle(self, case, cycle):
+        """依据当前有效结论重算周期内复测结论、周期与案件状态。"""
+        key = _subject_key(case["responsible_subject"])
+        for retest in cycle["retests"]:
+            task_findings = [
+                f for f in self.findings.values()
+                if f["task_id"] == retest["task_id"]
+                and _subject_key(f["responsible_subject"]) == key
+            ]
+            confirmed = [f for f in task_findings if f["status"] == FINDING_CONFIRMED]
+            retest["confirmed_count"] = len(confirmed)
+            retest["suspected_count"] = len(
+                [f for f in task_findings if f["status"] == FINDING_SUSPECTED])
+            retest["result"] = "passed" if not confirmed else "failed"
+            retest["note"] = (
+                "复测通过仅关闭当前整改周期，历史问题时段保留在既有周期中"
+                if not confirmed else "复测仍发现已确认问题，整改周期保持开启")
+        if cycle["retests"]:
+            if cycle["retests"][-1]["result"] == "passed":
+                cycle["status"] = CASE_RECTIFIED
+                cycle["rectified_at"] = cycle["retests"][-1]["at"]
+            else:
+                cycle["status"] = CASE_OPEN
+                cycle["rectified_at"] = None
 
     def generate_notice(self, subject_type, subject_id, payload):
         """对已确认发现生成告知材料；涉嫌发现一律不得进入材料。"""
@@ -617,8 +806,8 @@ class Lab:
             "rectification_deadline": issued_at + deadline_days * 86400,
             "rectification_days": deadline_days,
             "regulation_versions": sorted({f["regulation_version"] for f in pending}),
-            # 快照：后续任何操作都不得改动材料内容
-            "findings": [self._finding_snapshot(f) for f in pending],
+            # 快照：深拷贝；事后复核更正、案件重算都不得改动材料内容
+            "findings": [copy.deepcopy(self._finding_snapshot(f)) for f in pending],
         }
         self.notices[notice["notice_id"]] = notice
         cycle["notice_ids"].append(notice["notice_id"])
@@ -635,6 +824,14 @@ class Lab:
         cycle = case["cycles"][-1]
         if cycle["status"] != CASE_OPEN:
             raise DomainError("当前周期不在整改中")
+        # 复测资格：周期内必须仍有当前有效的已确认发现；
+        # 若依据发现已被更正驳回，复测失去判定依据（状态由更正流程重算）。
+        effective_confirmed = [
+            fid for fid in cycle["finding_ids"]
+            if self.findings[fid]["status"] == FINDING_CONFIRMED
+        ]
+        if not effective_confirmed:
+            raise DomainError("当前周期已无有效已确认发现，复测无依据；历史告知材料仍保留")
         task_id = _require(payload, "task_id", "复测")
         task = self._get_task(task_id)
         if task["status"] != "completed":
@@ -720,6 +917,15 @@ class Lab:
         cycles = []
         for cycle in case["cycles"]:
             notices = [self.notices[nid] for nid in cycle["notice_ids"]]
+            notice_id_set = set(cycle["notice_ids"])
+            # 该周期的更正链：当前仍在周期内的发现、曾进入本周期告知材料的发现的改判、
+            # 或更正发生时归属本周期的发现（含告知前已摘除的情形）
+            cycle_corrections = [
+                c for c in self.corrections.values()
+                if c.get("notice_id") in notice_id_set
+                or self.findings.get(c["finding_id"], {}).get("case_cycle_seq") == cycle["seq"]
+                or c.get("cycle_seq") == cycle["seq"]
+            ]
             cycles.append({
                 "seq": cycle["seq"],
                 "status": cycle["status"],
@@ -733,6 +939,7 @@ class Lab:
                     "regulation_versions": n["regulation_versions"],
                     "finding_count": len(n["findings"]),
                 } for n in notices],
+                "corrections": [self._correction_view(c) for c in cycle_corrections],
                 "retests": cycle["retests"],
                 "problem_period": self._problem_period(cycle),
                 "findings": [self._finding_snapshot(self.findings[fid]) for fid in cycle["finding_ids"]],
@@ -754,6 +961,22 @@ class Lab:
         return {
             "first_observed_at": min(f["observed_at"] for f in findings),
             "last_observed_at": max(f["observed_at"] for f in findings),
+        }
+
+    @staticmethod
+    def _correction_view(record):
+        return {
+            "review_id": record["review_id"],
+            "finding_id": record["finding_id"],
+            "from_decision": record["prior_decision"],
+            "to_decision": record["decision"],
+            "reason": record["reason"],
+            "reviewer": record["reviewer"],
+            "reviewer_role": record["reviewer_role"],
+            "at": record["at"],
+            "supersedes": record["supersedes"],
+            "notice_issued": record["notice_issued"],
+            "notice_id": record["notice_id"],
         }
 
     def _finding_snapshot(self, finding):
@@ -779,6 +1002,11 @@ class Lab:
             "regulation_version": finding["regulation_version"],
             "reviewed_by": finding["reviewed_by"],
             "review_comment": finding["review_comment"],
+            "case_id": finding.get("case_id"),
+            "case_cycle_seq": finding.get("case_cycle_seq"),
+            "notice_id": finding.get("notice_id"),
+            # 完整复核审计链：初始结论 + 历次更正，每条含理由、授权角色与前序引用
+            "reviews": copy.deepcopy(finding.get("reviews", [])),
             "evidence": events,
         }
 
@@ -791,7 +1019,7 @@ class Lab:
     def to_snapshot(self):
         data = {"next_seq": next(self._seq)}
         for name in ("regulations", "regulation_order", "devices", "builds",
-                     "tasks", "findings", "notices"):
+                     "tasks", "findings", "notices", "corrections"):
             data[name] = getattr(self, name)
         for name in self._TUPLE_DICTS:
             mapping = getattr(self, name)
@@ -802,7 +1030,7 @@ class Lab:
     def from_snapshot(cls, data, clock=time):
         lab = cls(clock=clock)
         for name in ("regulations", "regulation_order", "devices", "builds",
-                     "tasks", "findings", "notices"):
+                     "tasks", "findings", "notices", "corrections"):
             setattr(lab, name, data.get(name, {} if name != "regulation_order" else []))
         for name in cls._TUPLE_DICTS:
             setattr(lab, name, {tuple(item["key"]): item["value"] for item in data.get(name, [])})

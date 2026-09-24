@@ -230,5 +230,231 @@ class ApiFlowTest(unittest.TestCase):
                 os.unlink(path)
 
 
+class ReviewTerminalHttpTest(unittest.TestCase):
+    """终态/更正在 HTTP 层的语义：409、403、幂等、恢复与并发。"""
+
+    @classmethod
+    def setUpClass(cls):
+        service.reset_store()
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def setUp(self):
+        service.reset_store()
+
+    def post(self, path, body):
+        return call("POST", self.base + path, body)
+
+    def get(self, path):
+        return call("GET", self.base + path)
+
+    def _one_suspected(self, ad_id="a1"):
+        self.post("/admin/regulations",
+                  {"version": "v2025.1", "effective_at": 0,
+                   "params": {"rectification_days": 10}})
+        self.post("/devices", {"device_id": "dev-A", "model": "Pixel 6",
+                               "os_version": "Android 12"})
+        self.post("/builds", {
+            "app_id": APP_ID, "app_name": "某新闻", "developer": "某新闻运营有限公司",
+            "version_code": 1001, "version_name": "8.1.0"})
+        task = self.post("/tasks", {"build_id": f"{APP_ID}:1001",
+                                    "device_id": "dev-A", "track": "normal"})[1]
+        self.post(f"/tasks/{task['task_id']}/events", {"events": [
+            ad(ad_id), close(ad_id, 2, after=5, size=36)]})
+        self.post(f"/tasks/{task['task_id']}/complete", {})
+        report = self.get(f"/tasks/{task['task_id']}")[1]
+        return report["findings"][0]
+
+    def test_review_is_terminal_conflict_409_and_exact_replay_idempotent(self):
+        finding = self._one_suspected()
+        url = f"/findings/{finding['finding_id']}/review"
+        status, body = self.post(url, {"decision": "confirmed",
+                                       "reviewer": "复核员乙", "comment": "成立"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body["idempotent"])
+
+        # 完全相同的重放：200 + idempotent，不新增结论
+        status, replay = self.post(url, {"decision": "confirmed",
+                                         "reviewer": "复核员乙", "comment": "成立"})
+        self.assertEqual(status, 200)
+        self.assertTrue(replay["idempotent"])
+        self.assertEqual(replay["replay_of"], body["review"]["review_id"])
+
+        # 反向改判/换人：409 conflict，历史结论不被覆盖
+        status, conflict = self.post(url, {"decision": "dismissed",
+                                           "reviewer": "复核员戊"})
+        self.assertEqual(status, 409)
+        self.assertEqual(conflict["error"], "conflict")
+        status, _ = self.post(url, {"decision": "confirmed",
+                                    "reviewer": "复核员戊"})
+        self.assertEqual(status, 409)
+        # 当前有效结论与复核人仍是首次的
+        report = self.get(f"/tasks/{finding['task_id']}")[1]
+        row = report["findings"][0]
+        self.assertEqual(row["status"], "confirmed")
+        self.assertEqual(row["reviewed_by"], "复核员乙")
+        self.assertEqual(len(row["reviews"]), 1)
+
+    def test_correction_endpoint_403_409_and_audit_chain(self):
+        finding = self._one_suspected("a2")
+        review_url = f"/findings/{finding['finding_id']}/review"
+        correct_url = f"/findings/{finding['finding_id']}/corrections"
+        self.post(review_url, {"decision": "confirmed", "reviewer": "复核员乙"})
+
+        # 未授权角色 → 403
+        status, body = self.post(correct_url, {
+            "decision": "dismissed", "reviewer": "复核员乙",
+            "reviewer_role": "reviewer", "reason": "误判"})
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "forbidden")
+        # 缺理由 → 400
+        status, _ = self.post(correct_url, {
+            "decision": "dismissed", "reviewer": "监督负责人丁",
+            "reviewer_role": "supervisor"})
+        self.assertEqual(status, 400)
+        # 未初始复核的发现不能更正 → 409
+        fresh = self._one_suspected("a9")
+        status, _ = self.post(f"/findings/{fresh['finding_id']}/corrections", {
+            "decision": "dismissed", "reviewer": "监督负责人丁",
+            "reviewer_role": "supervisor", "reason": "误判"})
+        self.assertEqual(status, 409)
+
+        # 合法更正：201；完全重放：200 幂等
+        status, correction = self.post(correct_url, {
+            "decision": "dismissed", "reviewer": "监督负责人丁",
+            "reviewer_role": "supervisor", "reason": "补充证据证明入口可达"})
+        self.assertEqual(status, 201)
+        self.assertEqual(correction["review"]["prior_decision"], "confirmed")
+        status, replay = self.post(correct_url, {
+            "decision": "dismissed", "reviewer": "监督负责人丁",
+            "reviewer_role": "supervisor", "reason": "补充证据证明入口可达"})
+        self.assertEqual(status, 200)
+        self.assertTrue(replay["idempotent"])
+
+        # 任务报告反映当前有效结论与完整审计链
+        report = self.get(f"/tasks/{finding['task_id']}")[1]
+        row = report["findings"][0]
+        self.assertEqual(row["status"], "dismissed")
+        self.assertEqual(len(row["reviews"]), 2)
+        self.assertEqual(row["reviews"][0]["kind"], "initial")
+        self.assertEqual(row["reviews"][1]["kind"], "correction")
+        self.assertEqual(row["reviews"][1]["reviewer_role"], "supervisor")
+
+    def test_after_notice_correction_keeps_snapshot_and_reopens_nothing(self):
+        finding = self._one_suspected("a3")
+        fid = finding["finding_id"]
+        self.post(f"/findings/{fid}/review",
+                  {"decision": "confirmed", "reviewer": "复核员乙"})
+        status, notice = self.post(f"/subjects/app/{APP_ID}/notices",
+                                   {"issued_by": "承办人甲"})
+        self.assertEqual(status, 201)
+        self.post(f"/findings/{fid}/corrections", {
+            "decision": "dismissed", "reviewer": "监督负责人丁",
+            "reviewer_role": "supervisor", "reason": "告知后核验不成立"})
+        # 历史材料保持原样，责任视图挂出更正链
+        status, view = self.get(f"/subjects/app/{APP_ID}")
+        self.assertEqual(status, 200)
+        self.assertEqual(view["cycles"][0]["notices"][0]["finding_count"], 1)
+        self.assertEqual(len(view["cycles"][0]["corrections"]), 1)
+        self.assertTrue(view["cycles"][0]["corrections"][0]["notice_issued"])
+        # 无待告知项 → 再出告知 400
+        status, _ = self.post(f"/subjects/app/{APP_ID}/notices",
+                              {"issued_by": "承办人甲"})
+        self.assertEqual(status, 400)
+
+    def test_process_restart_recovers_correction_chain(self):
+        fd, path = tempfile.mkstemp(prefix="lab-", suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            service.reset_store(path)
+            finding = self._one_suspected("a4")
+            fid = finding["finding_id"]
+            self.post(f"/findings/{fid}/review",
+                      {"decision": "confirmed", "reviewer": "复核员乙"})
+            self.post(f"/subjects/app/{APP_ID}/notices", {"issued_by": "承办人甲"})
+            self.post(f"/findings/{fid}/corrections", {
+                "decision": "dismissed", "reviewer": "监督负责人丁",
+                "reviewer_role": "supervisor", "reason": "依据有误"})
+            # 模拟进程重启：从快照恢复，审计链完整
+            store = service.reset_store(path)
+            row = store.lab.findings[fid]
+            self.assertEqual(row["status"], "dismissed")
+            self.assertEqual(len(row["reviews"]), 2)
+            self.assertEqual(len(store.lab.corrections), 1)
+            status, view = self.get(f"/subjects/app/{APP_ID}")
+            self.assertEqual(status, 200)
+            self.assertEqual(view["cycles"][0]["corrections"][0]["to_decision"],
+                             "dismissed")
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_failed_write_rolls_back_half_case(self):
+        finding = self._one_suspected("a5")
+        store = service.STORE
+
+        def boom():
+            raise OSError("模拟磁盘写满")
+
+        original_save = store.save
+        store.save = boom
+        try:
+            status, _ = self.post(f"/findings/{finding['finding_id']}/review",
+                                  {"decision": "confirmed", "reviewer": "复核员乙"})
+            self.assertEqual(status, 500)
+        finally:
+            store.save = original_save
+        # 内存已回滚：发现仍涉嫌、无案件周期，重试是真正的首次结论
+        row = store.lab.findings[finding["finding_id"]]
+        self.assertEqual(row["status"], "suspected")
+        self.assertNotIn(("app", APP_ID), store.lab.cases)
+        status, body = self.post(f"/findings/{finding['finding_id']}/review",
+                                 {"decision": "confirmed", "reviewer": "复核员乙"})
+        self.assertEqual(status, 200)
+        self.assertFalse(body["idempotent"])
+
+    def test_concurrent_reviews_leave_single_initial_decision(self):
+        finding = self._one_suspected("a6")
+        url = f"/findings/{finding['finding_id']}/review"
+        results = []
+
+        def hit(decision, reviewer):
+            results.append(call(
+                "POST", self.base + url,
+                {"decision": decision, "reviewer": reviewer}))
+
+        threads = [
+            threading.Thread(target=hit, args=("confirmed", "复核员乙")),
+            threading.Thread(target=hit, args=("dismissed", "复核员戊")),
+            threading.Thread(target=hit, args=("confirmed", "复核员乙")),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        # 不变量（与调度顺序无关）：200 中恰有一个非幂等初始结论，
+        # 其余 200 只能是与初始结论完全一致的幂等重放；异内容一律 409。
+        self.assertTrue(all(code in (200, 409) for code, _ in results))
+        successes = [body for code, body in results if code == 200]
+        initials = [b for b in successes if not b["idempotent"]]
+        self.assertEqual(len(initials), 1)
+        winner = initials[0]["review"]
+        for body in successes:
+            self.assertEqual(body["review"]["decision"], winner["decision"])
+            self.assertEqual(body["review"]["reviewer"], winner["reviewer"])
+        row = service.STORE.lab.findings[finding["finding_id"]]
+        self.assertEqual(len(row["reviews"]), 1)
+        self.assertEqual(row["status"], winner["decision"])
+
+
 if __name__ == "__main__":
     unittest.main()

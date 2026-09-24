@@ -15,9 +15,15 @@ from domain import (
     TRACK_ELDERLY,
     TRACK_NORMAL,
     TRACK_SCREEN_READER,
+    AuthorizationError,
+    ConflictError,
     DomainError,
     Lab,
     NotFoundError,
+    REVIEW_CORRECTION,
+    REVIEW_INITIAL,
+    REVIEWER_ROLE_REVIEWER,
+    REVIEWER_ROLE_SUPERVISOR,
 )
 
 NOW = 1_700_000_000
@@ -428,6 +434,229 @@ class DomainFlowTest(unittest.TestCase):
         rows = [f for f in self.lab.findings.values()
                 if f["task_id"] == task["task_id"] and f["rule_id"] == rule_id]
         return rows[0] if rows else None
+
+
+class ReviewTerminalAndCorrectionTest(unittest.TestCase):
+    """复核终态、幂等重放与追加更正的回归测试。"""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.lab = base_lab(self.clock)
+
+    def _suspected_finding(self, ad_id="a1", device=DEV_A, track=TRACK_NORMAL):
+        """跑一条必出 R-CLOSE-001 涉嫌发现的任务，返回 finding。"""
+        task = self.lab.create_task(
+            {"build_id": BUILD_V1, "device_id": device, "track": track})
+        self.lab.ingest_events(task["task_id"], [
+            ad(ad_id), close(ad_id, 2, after=5, size=36),
+        ])
+        self.lab.complete_task(task["task_id"])
+        return next(
+            f for f in self.lab.findings.values() if f["task_id"] == task["task_id"])
+
+    def _confirm(self, finding, reviewer="复核员乙", comment="关闭路径确实不可用"):
+        return self.lab.review_finding(finding["finding_id"], {
+            "decision": FINDING_CONFIRMED, "reviewer": reviewer, "comment": comment})
+
+    def _dismiss(self, finding, reviewer="复核员乙", comment="误报"):
+        return self.lab.review_finding(finding["finding_id"], {
+            "decision": FINDING_DISMISSED, "reviewer": reviewer, "comment": comment})
+
+    def _correct(self, finding, decision, reason="补充证据表明原结论有误",
+                 reviewer="监督负责人丁", role=REVIEWER_ROLE_SUPERVISOR, **extra):
+        payload = {"decision": decision, "reviewer": reviewer,
+                   "reviewer_role": role, "reason": reason}
+        payload.update(extra)
+        return self.lab.correct_finding(finding["finding_id"], payload)
+
+    # ---------------------------------------------------------------- #
+
+    def test_initial_review_happens_once_and_exact_replay_is_idempotent(self):
+        finding = self._suspected_finding()
+        result = self._confirm(finding)
+        self.assertFalse(result["idempotent"])
+        self.assertEqual(finding["status"], FINDING_CONFIRMED)
+        self.assertEqual(len(self.lab.cases[("app", APP_ID)]["cycles"]), 1)
+
+        # 完全相同的请求重放：幂等返回，不产生第二条结论、不重复挂周期
+        replay = self._confirm(finding)
+        self.assertTrue(replay["idempotent"])
+        self.assertEqual(replay["replay_of"], result["review"]["review_id"])
+        self.assertEqual(len(finding["reviews"]), 1)
+        self.assertEqual(len(self.lab.cases[("app", APP_ID)]["cycles"]), 1)
+
+    def test_different_content_replay_conflicts_instead_of_overwriting(self):
+        finding = self._suspected_finding()
+        first = self._confirm(finding)
+        # 另一名复核员想从原入口反向改判：冲突，不得原地覆盖
+        with self.assertRaises(ConflictError):
+            self.lab.review_finding(finding["finding_id"],
+                                    {"decision": FINDING_DISMISSED, "reviewer": "复核员戊"})
+        # 同结论但换人/换意见同样冲突
+        with self.assertRaises(ConflictError):
+            self.lab.review_finding(finding["finding_id"],
+                                    {"decision": FINDING_CONFIRMED, "reviewer": "复核员戊"})
+        self.assertEqual(finding["status"], FINDING_CONFIRMED)
+        self.assertEqual(finding["reviewed_by"], "复核员乙")
+        self.assertEqual(len(finding["reviews"]), 1)
+        self.assertIsNone(first["review"]["superseded_by"])
+
+    def test_correction_requires_reason_and_authorized_role(self):
+        finding = self._suspected_finding()
+        self._confirm(finding)
+        # 缺理由
+        with self.assertRaises(DomainError):
+            self.lab.correct_finding(finding["finding_id"], {
+                "decision": FINDING_DISMISSED, "reviewer": "监督负责人丁",
+                "reviewer_role": REVIEWER_ROLE_SUPERVISOR})
+        # 普通复核员无权更正
+        with self.assertRaises(AuthorizationError):
+            self._correct(finding, FINDING_DISMISSED, role=REVIEWER_ROLE_REVIEWER)
+        # 未初始复核不得更正
+        fresh = self._suspected_finding("a9")
+        with self.assertRaises(ConflictError):
+            self._correct(fresh, FINDING_DISMISSED)
+        self.assertEqual(fresh["status"], FINDING_SUSPECTED)
+
+    def test_correction_before_notice_confirm_to_dismiss_removes_case(self):
+        finding = self._suspected_finding()
+        self._confirm(finding)
+        self.assertIn(("app", APP_ID), self.lab.cases)
+
+        result = self._correct(finding, FINDING_DISMISSED, reason="新证据证明入口可达")
+        correction = result["review"]
+        self.assertEqual(correction["kind"], REVIEW_CORRECTION)
+        self.assertEqual(correction["prior_decision"], FINDING_CONFIRMED)
+        self.assertEqual(correction["supersedes"], finding["reviews"][0]["review_id"])
+        self.assertFalse(correction["notice_issued"])
+        # 当前有效结论为驳回，待告知项消失，案件被整体摘除
+        self.assertEqual(finding["status"], FINDING_DISMISSED)
+        self.assertNotIn(("app", APP_ID), self.lab.cases)
+        with self.assertRaises(NotFoundError):
+            self.lab.generate_notice(SUBJECT_APP, APP_ID, {"issued_by": "承办人甲"})
+        # 初始结论仍在审计链中且标记被取代
+        self.assertEqual(len(finding["reviews"]), 2)
+        self.assertEqual(finding["reviews"][0]["superseded_by"], correction["review_id"])
+
+    def test_correction_before_notice_dismiss_to_confirm_creates_case(self):
+        finding = self._suspected_finding()
+        self._dismiss(finding)
+        self.assertNotIn(("app", APP_ID), self.lab.cases)
+        self._correct(finding, FINDING_CONFIRMED, reason="补查确认关闭路径确不可用")
+        self.assertEqual(finding["status"], FINDING_CONFIRMED)
+        notice = self.lab.generate_notice(SUBJECT_APP, APP_ID, {"issued_by": "承办人甲"})
+        self.assertEqual(notice["findings"][0]["finding_id"], finding["finding_id"])
+
+    def test_correction_after_notice_keeps_material_but_recomputes_state(self):
+        finding = self._suspected_finding()
+        self._confirm(finding)
+        notice = self.lab.generate_notice(SUBJECT_APP, APP_ID, {"issued_by": "承办人甲"})
+        self.assertEqual(notice["findings"][0]["status"], FINDING_CONFIRMED)
+
+        self._correct(finding, FINDING_DISMISSED, reason="告知后核验发现判定依据有误")
+        # 历史告知快照保持原样：仍写着「确认」
+        stored_notice = self.lab.notices[notice["notice_id"]]
+        self.assertEqual(stored_notice["findings"][0]["status"], FINDING_CONFIRMED)
+        self.assertEqual(len(stored_notice["findings"][0]["reviews"]), 1)
+
+        # 当前任务报告显示驳回；周期不再含该发现，待告知项为空
+        report = self.lab.task_report(finding["task_id"])
+        row = report["findings"][0]
+        self.assertEqual(row["status"], FINDING_DISMISSED)
+        self.assertEqual(len(row["reviews"]), 2)
+        with self.assertRaises(DomainError):
+            self.lab.generate_notice(SUBJECT_APP, APP_ID, {"issued_by": "承办人甲"})
+        # 无有效确认发现时复测失去依据
+        with self.assertRaises(DomainError):
+            self.lab.record_retest(SUBJECT_APP, APP_ID, {"task_id": finding["task_id"]})
+
+        # 责任主体视图保留周期、告知与更正审计链
+        view = self.lab.subject_view(SUBJECT_APP, APP_ID)
+        self.assertEqual(len(view["cycles"]), 1)
+        cycle = view["cycles"][0]
+        self.assertEqual(cycle["findings"], [])
+        self.assertIsNone(cycle["problem_period"])
+        self.assertEqual(cycle["notices"][0]["finding_count"], 1)
+        self.assertEqual(len(cycle["corrections"]), 1)
+        cview = cycle["corrections"][0]
+        self.assertEqual(cview["from_decision"], FINDING_CONFIRMED)
+        self.assertEqual(cview["to_decision"], FINDING_DISMISSED)
+        self.assertEqual(cview["notice_id"], notice["notice_id"])
+        self.assertTrue(cview["notice_issued"])
+
+    def test_correction_replay_rules(self):
+        finding = self._suspected_finding()
+        self._confirm(finding)
+        first = self._correct(finding, FINDING_DISMISSED, reason="依据有误")
+        # 完全相同的更正重放：幂等
+        replay = self._correct(finding, FINDING_DISMISSED, reason="依据有误")
+        self.assertTrue(replay["idempotent"])
+        self.assertEqual(replay["replay_of"], first["review"]["review_id"])
+        self.assertEqual(len(finding["reviews"]), 2)
+        # 同结论再更正属于冲突（结论与当前有效结论一致）
+        with self.assertRaises(ConflictError):
+            self._correct(finding, FINDING_DISMISSED, reason="另一个理由")
+
+    def test_correction_in_relapse_cycle_recomputes_retest_and_keeps_history(self):
+        # 第一周期：确认 + 告知 + 复测通过
+        first = self._suspected_finding("a1")
+        self._confirm(first)
+        self.lab.generate_notice(SUBJECT_APP, APP_ID, {"issued_by": "承办人甲"})
+        self.clock.advance(3 * 86400)
+        self.lab.register_build({
+            "app_id": APP_ID, "app_name": "某新闻", "developer": "某新闻运营有限公司",
+            "version_code": 1002, "version_name": "8.2.0"})
+        fixed = self.lab.create_task(
+            {"build_id": BUILD_V2, "device_id": DEV_A, "track": TRACK_NORMAL})
+        self.lab.ingest_events(fixed["task_id"], [ad("c1"), close("c1", 2, 1, 48)])
+        self.lab.complete_task(fixed["task_id"])
+        self.lab.record_retest(SUBJECT_APP, APP_ID, {"task_id": fixed["task_id"]})
+
+        # 回潮第二周期：新发现确认，复测失败（复测任务中又有确认发现）
+        self.clock.advance(20 * 86400)
+        relapsed = self._suspected_finding("d1", track=TRACK_ELDERLY)
+        self._confirm(relapsed)
+        bad = self._suspected_finding("d2", device=DEV_B, track=TRACK_NORMAL)
+        self._confirm(bad)
+        retest = self.lab.record_retest(SUBJECT_APP, APP_ID, {"task_id": bad["task_id"]})
+        self.assertEqual(retest["result"], "failed")
+
+        view = self.lab.subject_view(SUBJECT_APP, APP_ID)
+        self.assertEqual(view["relapse_count"], 1)
+        self.assertEqual(view["cycles"][1]["status"], "open")
+
+        # 告知后更正：复测依据发现被驳回 → 复测自动改判通过，周期关闭
+        self.lab.generate_notice(SUBJECT_APP, APP_ID, {"issued_by": "承办人甲"})
+        self._correct(bad, FINDING_DISMISSED, reason="回潮证据设备串号，不成立")
+        view = self.lab.subject_view(SUBJECT_APP, APP_ID)
+        cycle2 = view["cycles"][1]
+        self.assertEqual(cycle2["status"], "rectified")
+        self.assertEqual(cycle2["retests"][-1]["result"], "passed")
+        self.assertEqual(cycle2["retests"][-1]["confirmed_count"], 0)
+        # 回潮次数与第一周期历史不变
+        self.assertEqual(view["relapse_count"], 1)
+        self.assertEqual(view["cycles"][0]["status"], "rectified")
+        # 更正链挂在回潮周期下
+        self.assertEqual(len(cycle2["corrections"]), 1)
+        self.assertEqual(cycle2["corrections"][0]["finding_id"], bad["finding_id"])
+
+    def test_snapshot_preserves_review_chain_and_corrections(self):
+        finding = self._suspected_finding()
+        self._confirm(finding)
+        notice = self.lab.generate_notice(SUBJECT_APP, APP_ID, {"issued_by": "承办人甲"})
+        self._correct(finding, FINDING_DISMISSED, reason="依据有误")
+        data = self.lab.to_snapshot()
+        restored = Lab.from_snapshot(data, clock=self.clock)
+        row = restored.findings[finding["finding_id"]]
+        self.assertEqual(row["status"], FINDING_DISMISSED)
+        self.assertEqual(len(row["reviews"]), 2)
+        self.assertEqual(len(restored.corrections), 1)
+        # 历史告知材料仍为确认
+        self.assertEqual(restored.notices[notice["notice_id"]]["findings"][0]["status"],
+                         FINDING_CONFIRMED)
+        view = restored.subject_view(SUBJECT_APP, APP_ID)
+        self.assertEqual(view["cycles"][0]["corrections"][0]["to_decision"],
+                         FINDING_DISMISSED)
 
 
 if __name__ == "__main__":
