@@ -18,6 +18,12 @@
 - **规则与复核分离**：自动规则只能产生 `suspected`（涉嫌）发现；复核员 `confirmed`
   后才建立整改案件，已确认且尚未告知的发现才能进入告知材料，整改期限取所依据各版
   规范中最短者。
+- **复核终态与更正留痕**：涉嫌发现只能完成 **一次** 初始复核；与原请求完全相同
+  （结论/复核人/角色/意见一致）的重放幂等返回（响应头 `X-Idempotent-Replay: true`），
+  结论或复核人不同的重复请求返回 `409`，**不得原地覆盖**。确需纠正时必须通过
+  `POST /findings/{id}/corrections` 追加更正记录（携带 `reason`、授权 `role`
+  与前序结论引用 `prior_review_seq`）；当前有效结论恒为审计链末条，初始结论原样保留。
+  更正按是否已出具告知决定重算案件状态、待告知项与复测资格，**历史告知快照永不改写**。
 - **复测不抹历史、回潮可累计**：复测通过只关闭当前整改周期，周期内问题时段
   （首末观测时间）永久保留；已整改后再次确认问题开启新周期，`relapse_count` 加一，
   承办人员可按责任主体看到历次周期、告知、复测（含失败记录）与期限。
@@ -39,12 +45,14 @@
 python3 service.py --check          # 基础自检
 python3 service.py --port 8000      # 启动服务
 LAB_DATA_FILE=lab.json python3 service.py   # 证据快照落盘，重启恢复
-npm test                            # 运行契约 + 领域 + HTTP 共 18 项测试
+npm test                            # 运行契约 + 领域 + HTTP + 复核更正共 39 项测试
 ```
 
 ## 接口一览
 
-所有请求/响应均为 UTF-8 JSON；领域错误返回 `400`，实体不存在返回 `404`。
+所有请求/响应均为 UTF-8 JSON；领域错误返回 `400`，实体不存在返回 `404`，
+角色未授权返回 `403`，复核终态冲突返回 `409`（响应体含当前有效结论与审计链），
+落盘失败返回 `500`（内存已回滚到上一份持久快照）。
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -56,12 +64,13 @@ npm test                            # 运行契约 + 领域 + HTTP 共 18 项测
 | `POST /tasks` | 创建采集任务（`build_id`、`device_id`、`track`），响应含固化版本 |
 | `POST /tasks/{id}/events` | 幂等上报事件批次 `{"events": [...]}`，返回 `accepted/duplicates` |
 | `POST /tasks/{id}/complete` | 完成采集并运行规则 |
-| `GET /tasks/{id}` | 单任务报告：设备/系统/构建/无障碍设置/操作轨迹/发现与证据 |
+| `GET /tasks/{id}` | 单任务报告：设备/系统/构建/无障碍设置/操作轨迹/发现（含完整复核链）与证据 |
 | `GET /builds/{id}/report` | 同一构建跨设备、跨轨迹汇总 |
-| `POST /findings/{id}/review` | 复核：`{"decision": "confirmed|dismissed", "reviewer"}` |
-| `POST /subjects/{type}/{id}/notices` | 对已确认发现出具告知材料（期限、依据版本、证据快照） |
+| `POST /findings/{id}/review` | **唯一一次**初始复核 `{"decision": "confirmed|dismissed", "reviewer", "role"?, "comment"?}`；完全重放幂等返回（`X-Idempotent-Replay` 头），异内容重放 `409` |
+| `POST /findings/{id}/corrections` | 追加更正记录 `{"decision", "reviewer", "role": "reviewer|supervisor", "reason", "authorized_by"?, "comment"?}`，引用前序结论并回算案件/待告知/复测资格 |
+| `POST /subjects/{type}/{id}/notices` | 对已确认发现出具告知材料（期限、依据版本、证据快照，出具后永不改写） |
 | `POST /subjects/{type}/{id}/retests` | 登记复测 `{"task_id": ...}`，通过则关闭当前周期 |
-| `GET /subjects/{type}/{id}` | 承办人员视图：各整改周期、期限、问题时段、回潮次数 |
+| `GET /subjects/{type}/{id}` | 承办人员视图：各整改周期、期限、问题时段、回潮次数、当前有效结论数与告知后改判标注 |
 
 ### 事件结构
 
@@ -90,8 +99,10 @@ npm test                            # 运行契约 + 领域 + HTTP 共 18 项测
 ## 模块
 
 - `domain.py`：领域模型与规则引擎（纯 Python，无框架依赖），含快照序列化。
-- `service.py`：HTTP 入口与持久化仓储（`Store`，线程安全、原子写盘）。
+- `service.py`：HTTP 入口与持久化仓储（`Store`，线程安全、原子写盘、写盘失败回滚）。
 - `test_domain.py` / `test_api.py`：领域规则与 HTTP 全链路测试。
+- `test_correction.py`：复核终态与更正回归（告知前/后纠正、完全/异内容重放、
+  并发唯一初始结论、进程恢复、回潮周期更正）。
 - `fixtures/domain.json`：领域名词与状态词表，供接口联调对齐语义。
 
 ## 测试与构建
